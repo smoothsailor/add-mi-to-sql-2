@@ -1,0 +1,134 @@
+name: Assign user assigned identity permissions
+description: Assign the user assigned identity permissions on a specific Azure SQL database.
+
+inputs:
+  uai-name:
+    required: true
+  uai-resource-group:
+    required: true
+  sql-server-name:
+    required: true
+  sql-database-name:
+    required: true
+  uai-subscription-name:
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Output UAI
+      id: uai
+      shell: bash
+      run: |
+        UAMI_NAME="${{ inputs.uai-name }}"
+        # determine subscription flag if provided
+        if [ -n "${{ inputs.uai-subscription-name }}" ]; then
+            UAMI_PRINCIPAL_ID=$(az identity show --resource-group "${{ inputs.uai-resource-group }}" --name "$UAMI_NAME" --subscription ${{ inputs.uai-subscription-name }} --query principalId -o tsv)
+            UAMI_CLIENT_ID=$(az identity show --resource-group "${{ inputs.uai-resource-group }}" --name "$UAMI_NAME" --subscription ${{ inputs.uai-subscription-name }} --query clientId -o tsv)
+        else
+            UAMI_PRINCIPAL_ID=$(az identity show --resource-group "${{ inputs.uai-resource-group }}" --name "$UAMI_NAME" --query principalId -o tsv)
+            UAMI_CLIENT_ID=$(az identity show --resource-group "${{ inputs.uai-resource-group }}" --name "$UAMI_NAME" --query clientId -o tsv)
+        fi
+        echo "name=$UAMI_NAME" >> $GITHUB_OUTPUT
+        echo "principal-id=$UAMI_PRINCIPAL_ID" >> $GITHUB_OUTPUT
+        echo "client-id=$UAMI_CLIENT_ID" >> $GITHUB_OUTPUT
+
+    - name: Get database resource token
+      id: db-auth
+      shell: bash
+      run: |
+        DATABASE_TOKEN=$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)
+        if [ -z "$DATABASE_TOKEN" ]; then
+          echo "The user running this workflow was unable to get the an access token for resource 'https://database.windows.net/'." && \
+          echo "This is required as this will be used to authenticate against the database '${{ inputs.sql-database-name }}' on server '${{ inputs.sql-server-name }}.database.windows.net'." && \
+          echo "Without this token no user can be created or assigned permissions for user assigned identity '${{ steps.uai.outputs.client-id }}'." && \
+          exit 1
+        fi
+        echo "Token acquired successfully, storing as output for next steps."
+        echo "database-token=$DATABASE_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Run permission assignment script
+      shell: pwsh
+      run: |
+        If(-not(Get-InstalledModule SQLServer -ErrorAction silentlycontinue)){
+            Write-Host "Installing module SQLServer..."
+            Install-Module SQLServer -Confirm:$False -Force
+        }
+
+        $params = @{
+            'Database'              = "${{ inputs.sql-database-name }}"
+            'ServerInstance'        = "${{ inputs.sql-server-name }}.database.windows.net"
+            'AccessToken'           = "${{ steps.db-auth.outputs.database-token }}"
+            'OutputSqlErrors'       = $True
+            'AbortOnError'          = $True
+            'IncludeSqlUserErrors'  = $True
+            'ConnectionTimeout'     = 10
+            'QueryTimeout'          = 10
+        }
+
+        $query = "
+        DECLARE @sid VARBINARY(85) = CONVERT(VARBINARY(85), CONVERT(UNIQUEIDENTIFIER, '${{ steps.uai.outputs.client-id }}'));
+        DECLARE @ErrorNumber INT, @ErrorMessage NVARCHAR(MAX);
+
+        IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = '${{ steps.uai.outputs.name }}' AND sid = @sid)
+        BEGIN
+            RAISERROR('User ''${{ steps.uai.outputs.name }}'' with the provided client ID ''${{ steps.uai.outputs.client-id }}'' does not exist...', 10, 1) WITH NOWAIT;
+
+            IF EXISTS (SELECT * FROM sys.database_principals WHERE name = '${{ steps.uai.outputs.name }}')
+            BEGIN
+                RAISERROR('User ''${{ steps.uai.outputs.name }}'' exists with another sid, dropping current user...', 10, 1) WITH NOWAIT;
+                DROP USER [${{ steps.uai.outputs.name }}];
+            END
+
+            BEGIN TRY
+                RAISERROR('Creating ''create user'' SQL statement for EXEC command...', 10, 1) WITH NOWAIT;
+                DECLARE @sql NVARCHAR(1000) = CONCAT('CREATE USER [${{ steps.uai.outputs.name }}] WITH sid = ', CONVERT(NVARCHAR(64), @sid,1), ', TYPE = E')
+                RAISERROR('Executing SQL statement via EXEC to create user...', 10, 1) WITH NOWAIT;
+                EXEC (@sql)
+
+                RAISERROR('User ''${{ steps.uai.outputs.name }}'' with the provided client ID ''${{ steps.uai.outputs.client-id }}'' was created successfully.', 10, 1) WITH NOWAIT;
+
+                BEGIN TRY
+                    ALTER ROLE db_datareader ADD MEMBER [${{ steps.uai.outputs.name }}];
+                    ALTER ROLE db_datawriter ADD MEMBER [${{ steps.uai.outputs.name }}];
+                    ALTER USER [${{ steps.uai.outputs.name }}] WITH DEFAULT_SCHEMA=[dbo];
+
+                    RAISERROR('Granting ''create table'' permissions...', 10, 1) WITH NOWAIT;
+                    GRANT CREATE TABLE TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('Granting ''alter'' permissions...', 10, 1) WITH NOWAIT;
+                    GRANT ALTER TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('Granting ''control'' permissions...', 10, 1) WITH NOWAIT;
+                    GRANT CONTROL TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('Granting ''create schema'' permissions...', 10, 1) WITH NOWAIT;
+                    GRANT CREATE SCHEMA TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('Granting ''alter any schema''permissions', 10, 1) WITH NOWAIT;
+                    GRANT ALTER ANY SCHEMA TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('Granting ''references'' permissions', 10, 1) WITH NOWAIT;
+                    GRANT REFERENCES TO [${{ steps.uai.outputs.name }}];
+                    RAISERROR('User ''${{ steps.uai.outputs.name }}'' got assigned all roles and permissions successfully.', 10, 1) WITH NOWAIT;
+                END TRY
+                BEGIN CATCH
+                    RAISERROR('Error trying to grant roles and permissions to user ''${{ steps.uai.outputs.name }}''', 16, 1) WITH NOWAIT;
+                    SET @ErrorNumber = ERROR_NUMBER();
+                    SET @ErrorMessage = ERROR_MESSAGE();
+
+                    RAISERROR('Error Number: %d', 16, 1, @ErrorNumber) WITH NOWAIT;
+                    RAISERROR('Error Message: %s', 16, 1, @ErrorMessage) WITH NOWAIT;
+                END CATCH;
+            END TRY
+            BEGIN CATCH
+                RAISERROR('Error trying to create user ''${{ steps.uai.outputs.name }}''', 16, 1) WITH NOWAIT;
+                SET @ErrorNumber = ERROR_NUMBER();
+                SET @ErrorMessage = ERROR_MESSAGE();
+
+                RAISERROR('Error Number: %d', 16, 1, @ErrorNumber) WITH NOWAIT;
+                RAISERROR('Error Message: %s', 16, 1, @ErrorMessage) WITH NOWAIT;
+            END CATCH;
+        END
+        ELSE
+        BEGIN
+            RAISERROR('User ''${{ steps.uai.outputs.name }}'' with the provided client ID ''${{ steps.uai.outputs.client-id }}'' does already exist, doing nothing.', 10, 1) WITH NOWAIT;
+        END
+        ";
+
+        Invoke-Sqlcmd @params -Query $query -Verbose
